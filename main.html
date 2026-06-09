@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WebRTC Video Call</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <header class="top-bar">
+      <div>
+        <h1>WebRTC Video Call</h1>
+        <p class="subtitle">Room-based video calling with WebSockets signaling</p>
+      </div>
+      <div class="status-pill" id="connectionStatus">Disconnected</div>
+    </header>
+
+    <main class="main-grid">
+      <section class="panel panel--controls">
+        <div class="card">
+          <label for="wsUrl">Signaling WebSocket URL</label>
+          <input disabled id="wsUrl" type="text" value="wss://gyanendra6767-my-test-demo.hf.space" />
+        </div>
+
+        <div class="card">
+          <label for="roomId">Room ID</label>
+          <input id="roomId" type="text" placeholder="Enter a room code" autocomplete="off" />
+        </div>
+
+        <div class="card card--button-row">
+          <button id="joinButton" class="btn btn--primary">Join</button>
+          <button id="callButton" class="btn" disabled>Call</button>
+          <button id="leaveButton" class="btn btn--danger" disabled>Leave</button>
+        </div>
+
+        <div class="card">
+          <p class="info-line"><strong>Local</strong> video preview and <strong>remote</strong> display.</p>
+          <p class="info-line">Only two users are allowed per room.</p>
+        </div>
+      </section>
+
+      <section class="panel panel--video">
+        <div class="video-card">
+          <div class="video-label">Local Video</div>
+          <video id="localVideo" autoplay playsinline muted></video>
+        </div>
+
+        <div class="video-card">
+          <div class="video-label">Remote Video</div>
+          <video id="remoteVideo" autoplay playsinline></video>
+        </div>
+      </section>
+    </main>
+  </div>
+      <script>
+        const localVideo = document.getElementById("localVideo");
+const remoteVideo = document.getElementById("remoteVideo");
+const roomIdInput = document.getElementById("roomId");
+const wsUrlInput = document.getElementById("wsUrl");
+const joinButton = document.getElementById("joinButton");
+const callButton = document.getElementById("callButton");
+const leaveButton = document.getElementById("leaveButton");
+const connectionStatus = document.getElementById("connectionStatus");
+
+let localStream = null;
+let remoteStream = null;
+let peerConnection = null;
+let webSocket = null;
+let currentRoom = null;
+let isJoined = false;
+
+const configuration = {
+  iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
+};
+
+function logStatus(text, state = "default") {
+  connectionStatus.textContent = text;
+  connectionStatus.className = "status-pill";
+
+  if (state === "connected") {
+    connectionStatus.classList.add("connected");
+  } else if (state === "connecting") {
+    connectionStatus.classList.add("connecting");
+  } else if (state === "error") {
+    connectionStatus.classList.add("error");
+  }
+}
+
+function setButtonStates() {
+  joinButton.disabled = isJoined;
+  callButton.disabled = !isJoined;
+  leaveButton.disabled = !isJoined;
+}
+
+async function startLocalMedia() {
+  try {
+    logStatus("Requesting camera and microphone…", "connecting");
+    localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+    localVideo.srcObject = localStream;
+    logStatus("Local media ready.");
+  } catch (err) {
+    console.error("Failed to get local media", err);
+    logStatus("Unable to access camera/mic", "error");
+    throw err;
+  }
+}
+
+function createPeerConnection() {
+  peerConnection = new RTCPeerConnection(configuration);
+
+  peerConnection.addEventListener("icecandidate", (event) => {
+    if (event.candidate && webSocket && webSocket.readyState === WebSocket.OPEN) {
+      webSocket.send(JSON.stringify({ type: "ice", candidate: event.candidate }));
+    }
+  });
+
+  peerConnection.addEventListener("track", (event) => {
+    if (!remoteStream) {
+      remoteStream = new MediaStream();
+      remoteVideo.srcObject = remoteStream;
+    }
+    remoteStream.addTrack(event.track);
+  });
+
+  peerConnection.addEventListener("connectionstatechange", () => {
+    const state = peerConnection.connectionState;
+
+    if (state === "connected") {
+      logStatus("Peer connected", "connected");
+    } else if (state === "disconnected" || state === "failed") {
+      logStatus("Peer disconnected", "error");
+    } else if (state === "connecting") {
+      logStatus("Connecting peer…", "connecting");
+    }
+  });
+
+  localStream.getTracks().forEach((track) => {
+    peerConnection.addTrack(track, localStream);
+  });
+}
+
+async function handleOffer(offer) {
+  if (!peerConnection) {
+    createPeerConnection();
+  }
+
+  await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
+  const answer = await peerConnection.createAnswer();
+  await peerConnection.setLocalDescription(answer);
+
+  if (webSocket && webSocket.readyState === WebSocket.OPEN) {
+    webSocket.send(JSON.stringify({ type: "answer", answer }));
+  }
+}
+
+async function handleAnswer(answer) {
+  if (!peerConnection) {
+    console.warn("Received answer before PeerConnection created.");
+    return;
+  }
+
+  await peerConnection.setRemoteDescription(new RTCSessionDescription(answer));
+}
+
+async function handleIce(candidate) {
+  if (!peerConnection) {
+    console.warn("Received ICE candidate before PeerConnection created.");
+    return;
+  }
+
+  try {
+    await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+  } catch (err) {
+    console.error("Error adding ICE candidate", err);
+  }
+}
+
+function closePeerConnection() {
+  if (peerConnection) {
+    peerConnection.close();
+    peerConnection = null;
+  }
+
+  if (remoteStream) {
+    remoteStream.getTracks().forEach((track) => track.stop());
+    remoteStream = null;
+    remoteVideo.srcObject = null;
+  }
+}
+
+function closeLocalStream() {
+  if (localStream) {
+    localStream.getTracks().forEach((track) => track.stop());
+    localStream = null;
+    localVideo.srcObject = null;
+  }
+}
+
+function cleanupConnection() {
+  if (webSocket) {
+    if (webSocket.readyState === WebSocket.OPEN) {
+      webSocket.send(JSON.stringify({ type: "leave" }));
+    }
+    webSocket.close();
+    webSocket = null;
+  }
+
+  closePeerConnection();
+  closeLocalStream();
+  currentRoom = null;
+  isJoined = false;
+  setButtonStates();
+  logStatus("Disconnected");
+}
+
+async function joinRoom() {
+  const roomId = roomIdInput.value.trim();
+  const wsUrl = wsUrlInput.value.trim();
+
+  if (!roomId) {
+    logStatus("Enter a room ID", "error");
+    return;
+  }
+
+  if (!wsUrl) {
+    logStatus("Enter WebSocket URL", "error");
+    return;
+  }
+
+  try {
+    await startLocalMedia();
+  } catch {
+    return;
+  }
+
+  currentRoom = roomId;
+  webSocket = new WebSocket(wsUrl);
+  logStatus("Connecting to signaling server…", "connecting");
+
+  webSocket.addEventListener("open", () => {
+    isJoined = true;
+    setButtonStates();
+    logStatus("Connected to signaling server.");
+    webSocket.send(JSON.stringify({ type: "join", room: currentRoom }));
+  });
+
+  webSocket.addEventListener("message", async (event) => {
+    let data;
+    try {
+      data = JSON.parse(event.data);
+    } catch (err) {
+      console.error("Invalid JSON from signaling server", err);
+      return;
+    }
+
+    switch (data.type) {
+      case "peer-joined":
+        logStatus("Peer joined room. Ready to call.");
+        break;
+      case "offer":
+        logStatus("Received offer. Creating answer…", "connecting");
+        if (!peerConnection) {
+          createPeerConnection();
+        }
+        await handleOffer(data.offer);
+        break;
+      case "answer":
+        logStatus("Received answer. Finalizing connection…", "connecting");
+        await handleAnswer(data.answer);
+        break;
+      case "ice":
+        await handleIce(data.candidate);
+        break;
+      case "peer-left":
+        logStatus("Peer left the room.");
+        closePeerConnection();
+        break;
+      case "error":
+        logStatus(`Signaling error: ${data.message}`, "error");
+        break;
+      default:
+        console.warn("Unhandled signal type:", data.type);
+        break;
+    }
+  });
+
+  webSocket.addEventListener("close", () => {
+    if (isJoined) {
+      logStatus("Signaling connection closed.");
+      cleanupConnection();
+    }
+  });
+
+  webSocket.addEventListener("error", (err) => {
+    console.error("WebSocket error", err);
+    logStatus("Signaling server error", "error");
+  });
+}
+
+async function startCall() {
+  if (!isJoined || !webSocket || webSocket.readyState !== WebSocket.OPEN) {
+    logStatus("Must join a room first.", "error");
+    return;
+  }
+
+  if (!peerConnection) {
+    createPeerConnection();
+  }
+
+  try {
+    const offer = await peerConnection.createOffer();
+    await peerConnection.setLocalDescription(offer);
+    webSocket.send(JSON.stringify({ type: "offer", offer }));
+    logStatus("Offer sent. Waiting for answer…", "connecting");
+  } catch (err) {
+    console.error("Failed to create offer", err);
+    logStatus("Failed to start call", "error");
+  }
+}
+
+function leaveRoom() {
+  cleanupConnection();
+}
+
+joinButton.addEventListener("click", joinRoom);
+callButton.addEventListener("click", startCall);
+leaveButton.addEventListener("click", leaveRoom);
+
+setButtonStates();
+
+    </script>
+</body>
+</html>
